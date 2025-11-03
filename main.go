@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -216,11 +215,11 @@ func main() {
 		case <-timer.C:
 			if bpfModule.Stopped() {
 				log.Println("bpfModule stopped")
-				cmd := exec.Command("bpftool", []string{"map", "dump", "name", "main_bpf.data"}...)
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
-				if err := cmd.Run(); err != nil {
-					log.Printf("bpftool map dump failed: %v", err)
+				uei, err := bpfModule.GetUeiData()
+				if err == nil {
+					log.Println("uei", "kind", uei.Kind, "exitCode", uei.ExitCode, "reason", uei.GetReason(), "message", uei.GetMessage())
+				} else {
+					log.Println("GetUeiData failed", "error", err)
 				}
 				cont = false
 			}
