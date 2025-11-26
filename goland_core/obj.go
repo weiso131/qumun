@@ -1,11 +1,10 @@
 package core
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"log"
 	"syscall"
+	"unsafe"
 
 	"github.com/Gthulhu/plugin/models"
 	"github.com/Gthulhu/plugin/plugin"
@@ -101,14 +100,14 @@ func (s *Sched) Start() {
 		} else if m.Name() == "main_bpf.rodata" {
 			s.rodata = &RodataMap{m}
 		} else if m.Name() == "queued" {
-			s.queue = make(chan []byte, 4096)
+			s.queue = make(chan []byte, 128)
 			rb, err := s.mod.InitRingBuf("queued", s.queue)
 			if err != nil {
 				panic(err)
 			}
 			rb.Poll(10)
 		} else if m.Name() == "dispatched" {
-			s.dispatch = make(chan []byte, 4096)
+			s.dispatch = make(chan []byte, 128)
 			s.urb, err = s.mod.InitUserRingBuf("dispatched", s.dispatch)
 			if err != nil {
 				panic(err)
@@ -155,16 +154,16 @@ func (s *Sched) DefaultSelectCPU(t *models.QueuedTask) (error, int32) {
 
 func (s *Sched) selectCPU(t *models.QueuedTask) (error, int32) {
 	if s.selectCpu != nil {
-		arg := &task_cpu_arg{
+		arg := task_cpu_arg{
 			pid:   t.Pid,
 			cpu:   t.Cpu,
 			flags: t.Flags,
 		}
-		var data bytes.Buffer
-		binary.Write(&data, binary.LittleEndian, arg)
+
+		data := (*[16]byte)(unsafe.Pointer(&arg))[:]
 		opt := bpf.RunOpts{
-			CtxIn:     data.Bytes(),
-			CtxSizeIn: uint32(data.Len()),
+			CtxIn:     data,
+			CtxSizeIn: uint32(unsafe.Sizeof(arg)),
 		}
 		err := s.selectCpu.Run(&opt)
 		if err != nil {
@@ -190,14 +189,13 @@ type domain_arg struct {
 
 func (s *Sched) PreemptCpu(cpuId int32) error {
 	if s.preemptCpu != nil {
-		arg := &preempt_arg{
+		arg := preempt_arg{
 			cpuId: cpuId,
 		}
-		var data bytes.Buffer
-		binary.Write(&data, binary.LittleEndian, arg)
+		data := (*[4]byte)(unsafe.Pointer(&arg))[:]
 		opt := bpf.RunOpts{
-			CtxIn:     data.Bytes(),
-			CtxSizeIn: uint32(data.Len()),
+			CtxIn:     data,
+			CtxSizeIn: uint32(unsafe.Sizeof(arg)),
 		}
 		err := s.preemptCpu.Run(&opt)
 		if err != nil {
@@ -213,16 +211,15 @@ func (s *Sched) PreemptCpu(cpuId int32) error {
 
 func (s *Sched) EnableSiblingCpu(lvlId, cpuId, siblingCpuId int32) error {
 	if s.siblingCpu != nil {
-		arg := &domain_arg{
+		arg := domain_arg{
 			lvlId:        lvlId,
 			cpuId:        cpuId,
 			siblingCpuId: siblingCpuId,
 		}
-		var data bytes.Buffer
-		binary.Write(&data, binary.LittleEndian, arg)
+		data := (*[12]byte)(unsafe.Pointer(&arg))[:]
 		opt := bpf.RunOpts{
-			CtxIn:     data.Bytes(),
-			CtxSizeIn: uint32(data.Len()),
+			CtxIn:     data,
+			CtxSizeIn: uint32(unsafe.Sizeof(arg)),
 		}
 		err := s.siblingCpu.Run(&opt)
 		if err != nil {

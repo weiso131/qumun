@@ -36,6 +36,7 @@
 #include <scx/common.bpf.h>
 #endif
 
+#include <scx/percpu.bpf.h>
 #include "intf.h"
 #include <bpf/bpf_helpers.h>
 
@@ -449,6 +450,55 @@ static void update_priority_task_map(u32 pid, u64 vtime, u64 slice)
 }
 
 /*
+ * Return true if @this_cpu and @that_cpu are in the same LLC, false
+ * otherwise.
+ */
+static inline bool cpus_share_cache(s32 this_cpu, s32 that_cpu)
+{
+        if (this_cpu == that_cpu)
+                return true;
+
+	return cpu_llc_id(this_cpu) == cpu_llc_id(that_cpu);
+}
+
+/*
+ * Return true if @this_cpu is faster than @that_cpu, false otherwise.
+ */
+static inline bool is_cpu_faster(s32 this_cpu, s32 that_cpu)
+{
+        if (this_cpu == that_cpu)
+                return false;
+
+	return cpu_priority(this_cpu) > cpu_priority(that_cpu);
+}
+
+/*
+ * Return true if @cpu is a fully-idle SMT core, false otherwise.
+ */
+static inline bool is_smt_idle(s32 cpu)
+{
+	const struct cpumask *idle_smtmask;
+        bool is_idle;
+
+	if (!smt_enabled)
+		return true;
+
+	idle_smtmask = scx_bpf_get_idle_smtmask();
+        is_idle = bpf_cpumask_test_cpu(cpu, idle_smtmask);
+        scx_bpf_put_cpumask(idle_smtmask);
+
+	return is_idle;
+}
+
+/*
+ * Return true on a wake-up event, false otherwise.
+ */
+static inline bool is_wakeup(u64 wake_flags)
+{
+	return wake_flags & SCX_WAKE_TTWU;
+}
+
+/*
  * Find an idle CPU in the system for the task.
  *
  * NOTE: the idle CPU selection doesn't need to be formally perfect, it is
@@ -457,168 +507,65 @@ static void update_priority_task_map(u32 pid, u64 vtime, u64 slice)
  * to handle these mistakes in favor of a more efficient response and a reduced
  * scheduling overhead.
  */
-static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
+static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	const struct cpumask *idle_smtmask;
-	struct bpf_cpumask *l2_domain, *l3_domain;
-	struct bpf_cpumask *l2_mask, *l3_mask;
-	struct task_ctx *tctx;
-	struct cpu_ctx *cctx;
-	s32 cpu;
+	s32 cpu, this_cpu = bpf_get_smp_processor_id();
+	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
 
 	/*
 	 * For tasks that can run only on a single CPU, we can simply verify if
 	 * their only allowed CPU is still idle.
 	 */
-	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
+	if (p->nr_cpus_allowed == 1) {
 		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 			return prev_cpu;
 
 		return -EBUSY;
 	}
 
-	tctx = try_lookup_task_ctx(p);
-	if (!tctx)
-		return -ENOENT;
-
-	cctx = try_lookup_cpu_ctx(prev_cpu);
-	if (!cctx)
-		return -ENOENT;
-
 	/*
-	 * Acquire the CPU masks to determine the idle CPUs in the system.
+	 * On wakeup if the waker's CPU is faster than the wakee's CPU, try
+	 * to move the wakee closer to the waker.
+	 *
+	 * In presence of hybrid cores this helps to naturally migrate
+	 * tasks over to the faster cores.
 	 */
-	idle_smtmask = scx_bpf_get_idle_smtmask();
-
-	/*
-	 * Scheduling domains of the previously used CPU.
-	 */
-	l2_domain = cctx->l2_cpumask;
-	if (!l2_domain)
-		l2_domain = (struct bpf_cpumask *)p->cpus_ptr;
-
-	l3_domain = cctx->l3_cpumask;
-	if (!l3_domain)
-		l3_domain = (struct bpf_cpumask *)p->cpus_ptr;
-
-	if (p->nr_cpus_allowed == nr_cpu_ids) {
-		l2_mask = l2_domain;
-		l3_mask = l3_domain;
-	} else {
+	if (is_wakeup(wake_flags) &&
+	    is_cpu_faster(this_cpu, prev_cpu) && is_this_cpu_allowed) {
 		/*
-		 * Determine the cache domain as the intersection of the
-		 * task's primary cpumask and the cache domain mask of the
-		 * previously used CPU (ignore if the cache cpumask
-		 * completely overlaps with the task's cpumask).
+		 * If both the waker's CPU and the wakee's CPU are in the
+		 * same LLC and the wakee's CPU is a fully idle SMT core,
+		 * don't migrate.
 		 */
-		l2_mask = tctx->l2_cpumask;
-		if (!l2_mask) {
-			scx_bpf_error("L2 cpumask not initialized");
-			cpu = -ENOENT;
-			goto out_put_cpumask;
-		}
-		if (!bpf_cpumask_and(l2_mask, p->cpus_ptr, cast_mask(l2_domain)))
-			l2_mask = NULL;
+		if (cpus_share_cache(this_cpu, prev_cpu) &&
+		    is_smt_idle(prev_cpu) &&
+		    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			return prev_cpu;
 
-		l3_mask = tctx->l3_cpumask;
-		if (!l3_mask) {
-			scx_bpf_error("L3 cpumask not initialized");
-			cpu = -ENOENT;
-			goto out_put_cpumask;
-		}
-		if (!bpf_cpumask_and(l3_mask, p->cpus_ptr, cast_mask(l3_domain)))
-			l3_mask = NULL;
+		prev_cpu = this_cpu;
 	}
 
 	/*
-	 * Find the best idle CPU, prioritizing full idle cores in SMT systems.
+	 * Fallback to the old API if the kernel doesn't support
+	 * scx_bpf_select_cpu_and().
+	 *
+	 * This is required to support kernels <= 6.16.
 	 */
-	if (smt_enabled) {
-		/*
-		 * If the task can still run on the previously used CPU and
-		 * it's a full-idle core, keep using it.
-		 */
-		if (bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-			cpu = prev_cpu;
-			goto out_put_cpumask;
-		}
+	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+		bool is_idle = false;
 
-		/*
-		 * Search for any full-idle CPU in the task domain that shares
-		 * the same L2 cache.
-		 */
-		if (l2_mask) {
-			cpu = scx_bpf_pick_idle_cpu(cast_mask(l2_mask), SCX_PICK_IDLE_CORE);
-			if (cpu >= 0)
-				goto out_put_cpumask;
-		}
+		if (!wake_flags)
+			return -EBUSY;
 
-		/*
-		 * Search for any full-idle CPU in the task domain that shares
-		 * the same L3 cache.
-		 */
-		if (l3_mask) {
-			cpu = scx_bpf_pick_idle_cpu(cast_mask(l3_mask), SCX_PICK_IDLE_CORE);
-			if (cpu >= 0)
-				goto out_put_cpumask;
-		}
+		cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-		/*
-		 * Otherwise, search for another usable full-idle core.
-		 */
-		cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
-		if (cpu >= 0)
-			goto out_put_cpumask;
+		return is_idle ? cpu : -EBUSY;
 	}
 
 	/*
-	 * If a full-idle core can't be found (or if this is not an SMT system)
-	 * try to re-use the same CPU, even if it's not in a full-idle core.
+	 * Pick any idle CPU usable by the task.
 	 */
-	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-		cpu = prev_cpu;
-		goto out_put_cpumask;
-	}
-
-	/*
-	 * Search for any idle CPU in the primary domain that shares the same
-	 * L2 cache.
-	 */
-	if (l2_mask) {
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(l2_mask), 0);
-		if (cpu >= 0)
-			goto out_put_cpumask;
-	}
-
-	/*
-	 * Search for any idle CPU in the primary domain that shares the same
-	 * L3 cache.
-	 */
-	if (l3_mask) {
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(l3_mask), 0);
-		if (cpu >= 0)
-			goto out_put_cpumask;
-	}
-
-	/*
-	 * If all the previous attempts have failed, try to use any idle CPU in
-	 * the system.
-	 */
-	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-	if (cpu >= 0)
-		goto out_put_cpumask;
-
-	/*
-	 * If all the previous attempts have failed, dispatch the task to the
-	 * first CPU that will become available.
-	 */
-	cpu = -EBUSY;
-
-out_put_cpumask:
-	scx_bpf_put_cpumask(idle_smtmask);
-
-	return cpu;
+	return scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, p->cpus_ptr, 0);
 }
 
 /*
@@ -740,74 +687,17 @@ static bool is_wake_sync(u64 wake_flags)
 }
 
 /*
- * Try to dispatch a task directly on an idle CPU.
- *
- * On success, return the idle CPU where the task has been dispatched, or
- * return a negative value otherwise.
+ * Return true it's safe to dispatch directly on @cpu, false otherwise.
  */
-static s32 try_direct_dispatch(struct task_struct *p,
-			       s32 prev_cpu, u64 enq_flags, bool *dispatched)
+static bool can_direct_dispatch(s32 cpu)
 {
-	s32 cpu;
-
-	*dispatched = false;
-
-	/*
-	 * If built-in idle CPU policy is not enabled completely delegate
-	 * the idle selection policy to user-space and keep re-using the
-	 * same CPU here.
-	 */
-	if (!builtin_idle)
-		return -EBUSY;
-
-	/*
-	 * Pick the idle CPU closest to prev_cpu usable by the task.
-	 */
-	cpu = pick_idle_cpu(p, prev_cpu);
-	if (cpu < 0)
-		return cpu;
-
-	/*
-	 * If we picked an invalid CPU for the task, give up and ignore
-	 * direct dispatch.
-	 */
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-		/*
-		 * We selected a CPU that the task cannot run on, which
-		 * causes it to become idle-locked, so it can't be chosen
-		 * by other tasks and may remain unused for a long time.
-		 *
-		 * To avoid wasting CPU time, we kick the CPU to let it
-		 * pull a task from the SHARED_DSQ. If a task is available,
-		 * it runs for a slice, then returns idle again, refreshing
-		 * its state and becoming eligible again as an idle CPU. If
-		 * no task is available, it will continue running the idle
-		 * task, refreshing its idle state and rejoining the pool
-		 * of idle CPUs.
-		 */
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-		return -EBUSY;
-	}
-
-	/*
-	 * Perform direct dispatch only if the SHAREQ_DSQ is empty,
-	 * otherwise we may risk to starve the tasks waiting in the
-	 * SHARED_DSQ.
-	 */
-	if (!scx_bpf_dsq_nr_queued(SHARED_DSQ) && !scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu))) {
-		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
-		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
-		*dispatched = true;
-	}
-
-	return cpu;
+	return !scx_bpf_dsq_nr_queued(SHARED_DSQ) &&
+	       !scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 }
 
 s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	bool dispatched = false;
 	s32 cpu, this_cpu = bpf_get_smp_processor_id();
 	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
 
@@ -823,19 +713,35 @@ s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * Scheduler is dispatched directly in .dispatch() when needed, so
 	 * we can skip it here.
 	 */
-	if (is_belong_usersched_task(p)) {
+	if (is_belong_usersched_task(p))
 		return prev_cpu;
-	}
 
-	cpu = try_direct_dispatch(p, prev_cpu, 0, &dispatched);
-	if (cpu >= 0)
+	/*
+	 * If built-in idle CPU policy is not enabled, completely delegate
+	 * the idle selection policy to user-space and keep re-using the
+	 * same CPU here.
+	 */
+	if (!builtin_idle)
+		return prev_cpu;
+
+	/*
+	 * Pick the idle CPU closest to @prev_cpu usable by the task.
+	 */
+	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
+	if (cpu >= 0) {
+		if (can_direct_dispatch(cpu)) {
+			scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
+						 default_slice, p->scx.dsq_vtime, 0);
+			__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		}
 		return cpu;
+	}
 
 	/*
 	 * If we couldn't find an idle CPU, in case of a sync wakeup
 	 * prioritize the waker's CPU.
 	 */
-	return is_wake_sync(wake_flags) ? bpf_get_smp_processor_id() : prev_cpu;
+	return prev_cpu;
 }
 
 SEC("syscall")
@@ -853,16 +759,48 @@ SEC("syscall")
 int rs_select_cpu(struct task_cpu_arg *input)
 {
 	struct task_struct *p;
-	int cpu;
+	int cpu = input->cpu;
 
 	p = bpf_task_from_pid(input->pid);
 	if (!p)
 		return -EINVAL;
 
+	/*
+	 * If the target CPU is the current one, treat it as idle when no
+	 * other tasks are queued.
+	 *
+	 * Since this function is invoked by the user-space scheduler,
+	 * which will release the CPU shortly, there is no need to migrate
+	 * the task elsewhere.
+	 */
+	if (cpu == bpf_get_smp_processor_id()) {
+		u64 nr_tasks = nr_running + nr_queued + nr_scheduled + 1;
+
+		if (nr_tasks < nr_online_cpus && !scx_bpf_dsq_nr_queued(cpu))
+			goto out_release;
+	}
+
 	bpf_rcu_read_lock();
-	cpu = pick_idle_cpu(p, input->cpu);
+	/*
+	 * Kernels that don't provide scx_bpf_select_cpu_and() only allow
+	 * to use the built-in idle CPU selection policy only from
+	 * ops.select_cpu() and opt.enqueue(), return any idle CPU usable
+	 * by the task in this case.
+	 */
+	if (!bpf_ksym_exists(scx_bpf_select_cpu_and)) {
+		if (!scx_bpf_test_and_clear_cpu_idle(cpu))
+			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+	} else {
+		/*
+		 * Set SCX_WAKE_TTWU, pretending to be a wakeup, to prioritize
+		 * faster CPU selection (we probably want to add an option to allow
+		 * the user-space scheduler to use this logic or not).
+		 */
+		cpu = pick_idle_cpu(p, cpu, SCX_WAKE_TTWU);
+	}
 	bpf_rcu_read_unlock();
 
+out_release:
 	bpf_task_release(p);
 
 	return cpu;
@@ -913,7 +851,6 @@ static bool is_queued_wakeup(const struct task_struct *p, u64 enq_flags)
 static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq_flags)
 {
 	struct queued_task_ctx *task;
-	s32 cpu;
 
 	/*
 	 * Allocate a new entry in the ring buffer.
@@ -959,8 +896,8 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	if (is_belong_usersched_task(p)) {
 		if (usersched_has_pending_tasks()) {
 			/*
-			* Pick any other idle CPU that the task can use.
-			*/
+			 * Pick any other idle CPU that the task can use.
+			 */
 			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 			if (cpu > -1) {
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
@@ -1047,7 +984,7 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Try to find an idle CPU in the system, if all CPUs are busy
 	 * queue the task to the user-space scheduler.
 	 */
-	cpu = pick_idle_cpu(p, prev_cpu);
+	cpu = pick_idle_cpu(p, prev_cpu, 0);
 	if (cpu < 0) {
 		queue_task_to_userspace(p, prev_cpu, enq_flags);
 		goto out_kick;
@@ -1196,13 +1133,13 @@ void BPF_STRUCT_OPS(goland_running, struct task_struct *p)
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
+	u32 pid = p->pid;
+	bpf_map_update_elem(&running_task, &cpu, &pid, BPF_ANY);
+
 	if (is_usersched_task(p)) {
 		usersched_last_run_at = scx_bpf_now();
 		return;
 	}
-
-	u32 pid = p->pid;
-	bpf_map_update_elem(&running_task, &cpu, &pid, BPF_ANY);
 
 	dbg_msg("start: pid=%d (%s) cpu=%ld", p->pid, p->comm, cpu);
 
