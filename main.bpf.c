@@ -896,17 +896,18 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 	if (is_belong_usersched_task(p)) {
 		if (usersched_has_pending_tasks()) {
 			/*
-			 * Pick any other idle CPU that the task can use.
+			 * Try to find an idle CPU and dispatch directly to reduce latency.
+			 * This avoids the overhead of going through SCHED_DSQ.
 			 */
 			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-			if (cpu > -1) {
+			if (cpu >= 0) {
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
-				default_slice, SCX_ENQ_HEAD);
+					default_slice, SCX_ENQ_LAST);
 				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 				return;
 			}
 		}
-		scx_bpf_dsq_insert(p, SCHED_DSQ, default_slice, enq_flags);
+		scx_bpf_dsq_insert(p, SCHED_DSQ, default_slice, SCX_ENQ_LAST);
 		return;
 	}
 
@@ -1503,8 +1504,8 @@ void BPF_STRUCT_OPS(goland_update_idle, s32 cpu, bool idle)
 	 */
 	if (nr_queued || nr_scheduled) {
 		/*
-		 * Kick the CPU to make it immediately ready to accept
-		 * dispatched tasks.
+		 * Notify that user-space scheduler should run and kick this CPU
+		 * to make it immediately ready to accept dispatched tasks.
 		 */
 		set_usersched_needed();
 		scx_bpf_kick_cpu(cpu, 0);

@@ -83,16 +83,15 @@ func NewDispatchedTask(task *models.QueuedTask) *DispatchedTask {
 	}
 }
 
-func (s *Sched) DispatchTask(t *DispatchedTask) error {
-	if err := s.urb.Error(); err != nil {
-		return err
-	}
-	s.dispatch <- fastEncode(t)
-	return nil
-}
+// func (s *Sched) DispatchTask(t *DispatchedTask) error {
+// 	if err := s.urb.Error(); err != nil {
+// 		return err
+// 	}
+// 	s.dispatch <- fastEncode(t)
+// 	return nil
+// }
 
-// DispatchTaskSync dispatches a task and waits for completion.
-func (s *Sched) DispatchTaskSync(t *DispatchedTask) error {
+func (s *Sched) DispatchTask(t *DispatchedTask) error {
 	return s.urb.Submit(fastEncode(t))
 }
 

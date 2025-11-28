@@ -9,6 +9,7 @@ import (
 	"github.com/Gthulhu/plugin/models"
 	"github.com/Gthulhu/plugin/plugin"
 	bpf "github.com/aquasecurity/libbpfgo"
+	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -17,18 +18,18 @@ const (
 )
 
 type Sched struct {
-	mod        *bpf.Module
-	plugin     plugin.CustomScheduler
-	bss        *BssMap
-	uei        *UeiMap
-	rodata     *RodataMap
-	structOps  *bpf.BPFMap
-	queue      chan []byte // The map containing tasks that are queued to user space from the kernel.
-	dispatch   chan []byte
-	selectCpu  *bpf.BPFProg
-	preemptCpu *bpf.BPFProg
-	siblingCpu *bpf.BPFProg
-	urb        *bpf.UserRingBuffer
+	mod          *bpf.Module
+	plugin       plugin.CustomScheduler
+	bss          *BssMap
+	uei          *UeiMap
+	rodata       *RodataMap
+	structOps    *bpf.BPFMap
+	urb          *bpf.UserRingBuffer
+	queue        chan []byte // The map containing tasks that are queued to user space from the kernel.
+	dispatch     chan []byte
+	preemptCpu   *ebpf.Program
+	siblingCpu   *ebpf.Program
+	selectCpuPrg *ebpf.Program // Cilium eBPF program for syscall-based invocation
 }
 
 func init() {
@@ -112,7 +113,7 @@ func (s *Sched) Start() {
 			if err != nil {
 				panic(err)
 			}
-			s.urb.Start()
+			// s.urb.Start()
 		}
 		if m.Type().String() == "BPF_MAP_TYPE_STRUCT_OPS" {
 			s.structOps = m
@@ -127,15 +128,21 @@ func (s *Sched) Start() {
 		}
 
 		if prog.Name() == "rs_select_cpu" {
-			s.selectCpu = prog
+			if ciliumProg, err := ebpf.NewProgramFromFD(prog.FileDescriptor()); err == nil {
+				s.selectCpuPrg = ciliumProg
+			}
 		}
 
 		if prog.Name() == "enable_sibling_cpu" {
-			s.siblingCpu = prog
+			if ciliumProg, err := ebpf.NewProgramFromFD(prog.FileDescriptor()); err == nil {
+				s.siblingCpu = ciliumProg
+			}
 		}
 
 		if prog.Name() == "do_preempt" {
-			s.preemptCpu = prog
+			if ciliumProg, err := ebpf.NewProgramFromFD(prog.FileDescriptor()); err == nil {
+				s.preemptCpu = ciliumProg
+			}
 		}
 	}
 }
@@ -153,28 +160,30 @@ func (s *Sched) DefaultSelectCPU(t *models.QueuedTask) (error, int32) {
 }
 
 func (s *Sched) selectCPU(t *models.QueuedTask) (error, int32) {
-	if s.selectCpu != nil {
-		arg := task_cpu_arg{
-			pid:   t.Pid,
-			cpu:   t.Cpu,
-			flags: t.Flags,
-		}
-
-		data := (*[16]byte)(unsafe.Pointer(&arg))[:]
-		opt := bpf.RunOpts{
-			CtxIn:     data,
-			CtxSizeIn: uint32(unsafe.Sizeof(arg)),
-		}
-		err := s.selectCpu.Run(&opt)
-		if err != nil {
-			return err, 0
-		}
-		if opt.RetVal > 2147483647 {
-			return nil, RL_CPU_ANY
-		}
-		return nil, int32(opt.RetVal)
+	if s.selectCpuPrg == nil {
+		return selectFailed, 0
 	}
-	return selectFailed, 0
+
+	arg := task_cpu_arg{
+		pid:   t.Pid,
+		cpu:   t.Cpu,
+		flags: t.Flags,
+	}
+
+	data := (*[16]byte)(unsafe.Pointer(&arg))[:]
+
+	ret, err := s.selectCpuPrg.Run(&ebpf.RunOptions{
+		Context: data[:],
+	})
+	if err != nil {
+		return err, 0
+	}
+
+	retVal := int32(ret)
+	if ret > 2147483647 {
+		return nil, RL_CPU_ANY
+	}
+	return nil, retVal
 }
 
 type preempt_arg struct {
@@ -188,49 +197,49 @@ type domain_arg struct {
 }
 
 func (s *Sched) PreemptCpu(cpuId int32) error {
-	if s.preemptCpu != nil {
-		arg := preempt_arg{
-			cpuId: cpuId,
-		}
-		data := (*[4]byte)(unsafe.Pointer(&arg))[:]
-		opt := bpf.RunOpts{
-			CtxIn:     data,
-			CtxSizeIn: uint32(unsafe.Sizeof(arg)),
-		}
-		err := s.preemptCpu.Run(&opt)
-		if err != nil {
-			return err
-		}
-		if opt.RetVal != 0 {
-			return fmt.Errorf("retVal: %v", opt.RetVal)
-		}
-		return nil
+	if s.preemptCpu == nil {
+		return fmt.Errorf("prog (preemptCpu) not found")
 	}
-	return fmt.Errorf("prog (selectCpu) not found")
+
+	arg := preempt_arg{
+		cpuId: cpuId,
+	}
+	data := (*[4]byte)(unsafe.Pointer(&arg))[:]
+
+	ret, err := s.preemptCpu.Run(&ebpf.RunOptions{
+		Context: data[:],
+	})
+	if err != nil {
+		return err
+	}
+	if ret != 0 {
+		return fmt.Errorf("retVal: %v", ret)
+	}
+	return nil
 }
 
 func (s *Sched) EnableSiblingCpu(lvlId, cpuId, siblingCpuId int32) error {
-	if s.siblingCpu != nil {
-		arg := domain_arg{
-			lvlId:        lvlId,
-			cpuId:        cpuId,
-			siblingCpuId: siblingCpuId,
-		}
-		data := (*[12]byte)(unsafe.Pointer(&arg))[:]
-		opt := bpf.RunOpts{
-			CtxIn:     data,
-			CtxSizeIn: uint32(unsafe.Sizeof(arg)),
-		}
-		err := s.siblingCpu.Run(&opt)
-		if err != nil {
-			return err
-		}
-		if opt.RetVal != 0 {
-			return fmt.Errorf("retVal: %v", opt.RetVal)
-		}
-		return nil
+	if s.siblingCpu == nil {
+		return fmt.Errorf("prog (siblingCpu) not found")
 	}
-	return fmt.Errorf("prog (siblingCpu) not found")
+
+	arg := domain_arg{
+		lvlId:        lvlId,
+		cpuId:        cpuId,
+		siblingCpuId: siblingCpuId,
+	}
+	data := (*[12]byte)(unsafe.Pointer(&arg))[:]
+
+	ret, err := s.siblingCpu.Run(&ebpf.RunOptions{
+		Context: data[:],
+	})
+	if err != nil {
+		return err
+	}
+	if ret != 0 {
+		return fmt.Errorf("retVal: %v", ret)
+	}
+	return nil
 }
 
 func (s *Sched) Attach() error {
@@ -239,6 +248,15 @@ func (s *Sched) Attach() error {
 }
 
 func (s *Sched) Close() {
+	if s.selectCpuPrg != nil {
+		s.selectCpuPrg.Close()
+	}
+	if s.siblingCpu != nil {
+		s.siblingCpu.Close()
+	}
+	if s.preemptCpu != nil {
+		s.preemptCpu.Close()
+	}
 	s.urb.Close()
 	s.mod.Close()
 }
