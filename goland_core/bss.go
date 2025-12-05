@@ -15,11 +15,11 @@ import (
 import "C"
 
 type BssData struct {
-	Usersched_last_run_at uint64 `json:"usersched_last_run_at"` // The PID of the userspace scheduler
+	Nr_running            uint64 `json:"nr_running"`            // Number of tasks currently running in the userspace scheduler
 	Nr_queued             uint64 `json:"nr_queued"`             // Number of tasks queued in the userspace scheduler
 	Nr_scheduled          uint64 `json:"nr_scheduled"`          // Number of tasks scheduled by the userspace scheduler
-	Nr_running            uint64 `json:"nr_running"`            // Number of tasks currently running in the userspace scheduler
 	Nr_online_cpus        uint64 `json:"nr_online_cpus"`        // Number of online CPUs in the system
+	Usersched_last_run_at uint64 `json:"usersched_last_run_at"` // The PID of the userspace scheduler
 	Nr_user_dispatches    uint64 `json:"nr_user_dispatches"`    // Number of user-space dispatches
 	Nr_kernel_dispatches  uint64 `json:"nr_kernel_dispatches"`  // Number of kernel-space dispatches
 	Nr_cancel_dispatches  uint64 `json:"nr_cancel_dispatches"`  // Number of cancelled dispatches

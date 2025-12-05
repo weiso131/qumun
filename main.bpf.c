@@ -417,7 +417,7 @@ static bool usersched_has_pending_tasks(void)
 	if (usersched_needed)
 		return true;
 
-	if (nr_scheduled)
+	if (nr_queued || nr_scheduled)
 		return true;
 
 	return bpf_ringbuf_query(&queued, BPF_RB_AVAIL_DATA) > 0;
