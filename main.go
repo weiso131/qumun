@@ -149,6 +149,12 @@ func main() {
 	if err != nil {
 		log.Printf("AssignUserSchedPid failed: %v", err)
 	}
+
+	err = util.ImportScxEnums()
+	if err != nil {
+		log.Panicf("ImportScxEnums failed: %v", err)
+	}
+
 	bpfModule.SetDebug(true)
 	bpfModule.SetBuiltinIdle(true)
 	bpfModule.Start()
@@ -158,17 +164,20 @@ func main() {
 		log.Panicf("InitCacheDomains failed: %v", err)
 	}
 
-	err = util.ImportScxEnums()
-	if err != nil {
-		log.Panicf("ImportScxEnums failed: %v", err)
-	}
-
 	if err := bpfModule.Attach(); err != nil {
 		log.Panicf("bpfModule attach failed: %v", err)
 	}
 
 	log.Printf("UserSched's Pid: %v", core.GetUserSchedPid())
 	log.Printf("scheduler started")
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	cont := true
+	timer := time.NewTicker(1 * time.Second)
+	notifyCount := 0
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
 		var t *models.QueuedTask
@@ -177,15 +186,21 @@ func main() {
 		var cpu int32
 
 		for true {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			t = GetTaskFromPool()
 			if t == nil {
-				bpfModule.BlockTilReadyForDequeue(context.TODO())
+				bpfModule.BlockTilReadyForDequeue(ctx)
 				DrainQueuedTask(bpfModule)
 			} else if t.Pid != -1 {
 				task = core.NewDispatchedTask(t)
 				err, cpu = bpfModule.SelectCPU(t)
 				if err != nil {
 					log.Printf("SelectCPU failed: %v", err)
+					return
 				}
 
 				// Evaluate used task time slice.
@@ -197,26 +212,23 @@ func main() {
 				err = bpfModule.DispatchTask(task)
 				if err != nil {
 					log.Printf("DispatchTask failed: %v", err)
-					continue
+					return
 				}
 
 				err = core.NotifyComplete(uint64(taskPoolCount))
 				if err != nil {
 					log.Printf("NotifyComplete failed: %v", err)
+					return
 				}
 			}
 		}
 	}()
 
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
-	cont := true
-	timer := time.NewTicker(1 * time.Second)
-	notifyCount := 0
 	for cont {
 		select {
 		case <-signalChan:
 			log.Println("receive os signal")
+			cancel()
 			cont = false
 		case <-timer.C:
 			notifyCount++

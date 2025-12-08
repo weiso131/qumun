@@ -50,11 +50,10 @@ LIBBPF_OBJDIR = $(abspath ./$(OUTPUT)/libbpf)
 LIBBPF_DESTDIR = $(abspath ./$(OUTPUT))
 CLANG_BPF_SYS_INCLUDES := `shell $(CLANG) -v -E - </dev/null 2>&1 | sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }'`
 CGOFLAG = $(GOARCH_ENV) CC=$(CGO_CC) CGO_CFLAGS="-I$(BASEDIR) -I$(BASEDIR)/$(OUTPUT)" CGO_LDFLAGS="-lelf -lz $(LIBBPF_OBJ) -lzstd $(BASEDIR)/libwrapper.a"
-STATIC=-extldflags -static
 
 .PHONY: build
 build: clean $(BPF_OBJ) libbpf libbpf-uapi wrapper
-	$(CGOFLAG) go build -ldflags "-w -s $(STATIC)" main.go
+	$(CGOFLAG) go build -ldflags "-w -s" main.go
 
 test: build
 	@echo "Running scheduler test..."
@@ -91,7 +90,7 @@ $(BPF_OBJ): %.o: %.c
 		-O2 -g -Wall -target bpf \
 		$(ARCH_DEFINE) $(ARCH_CPU_FLAGS) -mlittle-endian \
 		-idirafter /usr/lib/llvm-17/lib/clang/17/include -idirafter /usr/local/include -idirafter /usr/include/$(ARCH_INCLUDE_DIR) -idirafter /usr/include \
-		-I scx/build/libbpf/src/usr/include -I scx/build/libbpf/include/uapi -I scx/scheds/include $(ARCH_SCHED_INCLUDE) -I scx/scheds/include/bpf-compat -I scx/scheds/include/lib \
+		-I scx/scheds/vmlinux -I scx/build/libbpf/src/usr/include -I scx/build/libbpf/include/uapi -I scx/scheds/include $(ARCH_SCHED_INCLUDE) -I scx/scheds/include/bpf-compat -I scx/scheds/include/lib \
 		-Wno-compare-distinct-pointer-types \
 		-c $< -o $@
 
