@@ -43,6 +43,10 @@ void set_builtin_idle(bool enabled) {
     global_obj->rodata->builtin_idle = enabled;
 }
 
+void enable_kernel_mode() {
+    global_obj->rodata->kernel_mode = true;
+}
+
 u64 get_nr_scheduled() {
     return global_obj->bss->nr_scheduled;
 }

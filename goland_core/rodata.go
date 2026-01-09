@@ -113,6 +113,10 @@ func (s *Sched) SetBuiltinIdle(enabled bool) {
 	C.set_builtin_idle(C.bool(enabled))
 }
 
+func (s *Sched) EnableKernelMode() {
+	C.enable_kernel_mode()
+}
+
 func (s *Sched) SetEarlyProcessing(enabled bool) {
 	C.set_early_processing(C.bool(enabled))
 }

@@ -137,6 +137,22 @@ const volatile bool builtin_idle;
  */
 const volatile bool smt_enabled = true;
 
+const volatile bool kernel_mode = false;
+
+/*
+ * Maximum time slice lag for kernel mode.
+ *
+ * Increasing this value can help to increase the responsiveness of interactive
+ * tasks at the cost of making regular and newly created tasks less responsive
+ * (0 = disabled).
+ */
+const volatile u64 slice_lag = 40ULL * NSEC_PER_MSEC;
+
+/*
+ * Current global vruntime (used in kernel mode).
+ */
+static u64 vtime_now;
+
 /*
  * Allocate/re-allocate a new cpumask.
  */
@@ -262,6 +278,21 @@ struct task_ctx {
 	 * Execution time (in nanoseconds) since the last sleep event.
 	 */
 	u64 exec_runtime;
+
+	/*
+	 * Accumulated vruntime since last sleep (kernel mode).
+	 */
+	u64 awake_vtime;
+
+	/*
+	 * Timestamp of last wakeup (kernel mode).
+	 */
+	u64 last_woke_at;
+
+	/*
+	 * Wakeup frequency (kernel mode).
+	 */
+	u64 wakeup_freq;
 };
 
 /* Map that contains task-local storage. */
@@ -695,6 +726,183 @@ static bool can_direct_dispatch(s32 cpu)
 	       !scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 }
 
+/*
+ * Maximum rate of task wakeups/sec (tasks with a higher rate are capped to
+ * this value).
+ *
+ * Note that the wakeup rate is evaluate over a period of 100ms, so this
+ * number must be multiplied by 10 to determine the actual limit in
+ * wakeups/sec.
+ */
+#define MAX_WAKEUP_FREQ		64ULL
+
+/*
+ * Maximum time a task can wait in the scheduler's queue before triggering
+ * a stall (kernel mode).
+ */
+#define STARVATION_MS	5000ULL
+
+/*
+ * Exponential weighted moving average (EWMA).
+ *
+ * Returns the new average as:
+ *
+ *	new_avg := (old_avg * .75) + (new_val * .25);
+ */
+static u64 calc_avg(u64 old_val, u64 new_val)
+{
+	return (old_val - (old_val >> 2)) + (new_val >> 2);
+}
+
+/*
+ * Update the average frequency of an event.
+ *
+ * The frequency is computed from the given interval since the last event
+ * and combined with the previous frequency using an exponential weighted
+ * moving average.
+ */
+static u64 update_freq(u64 freq, u64 interval)
+{
+	u64 new_freq;
+
+	new_freq = (100 * NSEC_PER_MSEC) / interval;
+	return calc_avg(freq, new_freq);
+}
+
+/*
+ * Calculate and return the virtual deadline for the given task (kernel mode).
+ *
+ *  The deadline is defined as:
+ *
+ *    deadline = vruntime + awake_vtime
+ *
+ * Here, `vruntime` represents the task's total accumulated runtime,
+ * inversely scaled by its weight, while `awake_vtime` accounts the runtime
+ * accumulated since the last sleep event, also inversely scaled by the
+ * task's weight.
+ *
+ * Fairness is driven by `vruntime`, while `awake_vtime` helps prioritize
+ * tasks that sleep frequently and use the CPU in short bursts (resulting
+ * in a small `awake_vtime` value), which are typically latency critical.
+ */
+static u64 task_deadline(struct task_struct *p, s32 cpu, struct task_ctx *tctx)
+{
+	/*
+	 * Reference queue depth: how many tasks would take 1/10 the SLA to
+	 * drain at average slice usage.
+	 */
+	const u64 STARVATION_THRESH = STARVATION_MS * NSEC_PER_MSEC / 10;
+	const u64 q_thresh = MAX(STARVATION_THRESH / default_slice, 1);
+
+	u64 nr_queue = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+			scx_bpf_dsq_nr_queued(SHARED_DSQ);
+	u64 lag_scale = MAX(tctx->wakeup_freq, 1);
+	u64 awake_max = scale_by_task_weight_inverse(p, slice_lag);
+	u64 vtime_min;
+
+	/*
+	 * Queue pressure factor = q_thresh / (q_thresh + nr_queued), applied to
+	 * @lag_scale.
+	 *
+	 * Emergency clamp: if queued work (q * default_slice) already spans
+	 * the starvation window, stop boosting vruntime credit.
+	 */
+	if (nr_queue * default_slice >= STARVATION_THRESH)
+		lag_scale = 1;
+	else
+		lag_scale = MAX(lag_scale * q_thresh / (q_thresh + nr_queue), 1);
+
+	/*
+	 * Cap the partial accumulated vruntime since last sleep in
+	 * function of @slice_lag and @lag_scale.
+	 */
+	vtime_min = vtime_now - scale_by_task_weight(p, slice_lag * lag_scale);
+	if (time_before(p->scx.dsq_vtime, vtime_min))
+		p->scx.dsq_vtime = vtime_min;
+
+	/*
+	 * Cap the partial accumulated vruntime since last sleep to
+	 * @slice_lag.
+	 */
+	if (time_after(tctx->awake_vtime, awake_max))
+		tctx->awake_vtime = awake_max;
+
+	/*
+	 * Evaluate task's deadline as the accumulated vruntime +
+	 * accumulated vruntime since last sleep.
+	 */
+	return p->scx.dsq_vtime + tctx->awake_vtime;
+}
+
+/*
+ * Return a time slice scaled by the task's weight (kernel mode).
+ */
+static u64 task_slice(const struct task_struct *p, s32 cpu)
+{
+	u64 nr_wait = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+		      scx_bpf_dsq_nr_queued(SHARED_DSQ);
+
+	/*
+	 * Adjust time slice in function of the task's priority and the
+	 * amount of tasks waiting to be dispatched.
+	 */
+	return scale_by_task_weight(p, default_slice) / MAX(nr_wait, 1);
+}
+
+/*
+ * Return true if the task can only run on a single CPU, false otherwise.
+ */
+static inline bool is_pcpu_task(const struct task_struct *p)
+{
+	return p->nr_cpus_allowed == 1 || is_migration_disabled(p);
+}
+
+/*
+ * Dispatch a task in kernel mode to the appropriate DSQ.
+ */
+static void dispatch_task_kernel_mode(struct task_struct *p, s32 cpu, u64 enq_flags)
+{
+	struct task_ctx *tctx;
+
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx) {
+		/*
+		 * Fallback: dispatch with default values if no task context.
+		 */
+		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
+					 default_slice, p->scx.dsq_vtime, enq_flags);
+		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		return;
+	}
+
+	scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
+				 task_slice(p, cpu), task_deadline(p, cpu, tctx), enq_flags);
+	__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+}
+
+/*
+ * Dispatch a task to SHARED_DSQ in kernel mode.
+ */
+static void dispatch_task_shared_kernel_mode(struct task_struct *p, s32 cpu, u64 enq_flags)
+{
+	struct task_ctx *tctx;
+
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx) {
+		/*
+		 * Fallback: dispatch with default values if no task context.
+		 */
+		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
+					 default_slice, p->scx.dsq_vtime, enq_flags);
+		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		return;
+	}
+
+	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
+				 task_slice(p, cpu), task_deadline(p, cpu, tctx), enq_flags);
+	__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+}
+
 s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -711,17 +919,17 @@ s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	/*
 	 * Scheduler is dispatched directly in .dispatch() when needed, so
-	 * we can skip it here.
+	 * we can skip it here. (Only in user-space mode)
 	 */
-	if (is_belong_usersched_task(p))
+	if (!kernel_mode && is_belong_usersched_task(p))
 		return prev_cpu;
 
 	/*
-	 * If built-in idle CPU policy is not enabled, completely delegate
-	 * the idle selection policy to user-space and keep re-using the
-	 * same CPU here.
+	 * If built-in idle CPU policy is not enabled and not in kernel mode,
+	 * completely delegate the idle selection policy to user-space and
+	 * keep re-using the same CPU here.
 	 */
-	if (!builtin_idle)
+	if (!builtin_idle && !kernel_mode)
 		return prev_cpu;
 
 	/*
@@ -730,9 +938,16 @@ s32 BPF_STRUCT_OPS(goland_select_cpu, struct task_struct *p, s32 prev_cpu,
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
 	if (cpu >= 0) {
 		if (can_direct_dispatch(cpu)) {
-			scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-						 default_slice, p->scx.dsq_vtime, 0);
-			__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+			if (kernel_mode) {
+				/*
+				 * In kernel mode, use deadline-based dispatch.
+				 */
+				dispatch_task_kernel_mode(p, cpu, 0);
+			} else {
+				scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
+							 default_slice, p->scx.dsq_vtime, 0);
+				__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+			}
 		}
 		return cpu;
 	}
@@ -879,6 +1094,74 @@ static void queue_task_to_userspace(struct task_struct *p, s32 prev_cpu, u64 enq
 }
 
 /*
+ * Enqueue a task in kernel mode.
+ *
+ * In kernel mode, all scheduling decisions are made in eBPF.
+ * Tasks are dispatched directly to per-CPU DSQs or SHARED_DSQ
+ * based on deadline-based scheduling similar to bpfland.
+ */
+static void enqueue_task_kernel_mode(struct task_struct *p, u64 enq_flags)
+{
+	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
+	struct task_ctx *tctx;
+
+	/*
+	 * Always dispatch per-CPU kthreads directly on their target CPU.
+	 *
+	 * This allows to prioritize critical kernel threads that may
+	 * potentially stall the entire system if they are blocked for too long
+	 * (i.e., ksoftirqd/N, rcuop/N, etc.).
+	 */
+	if (is_kthread(p) && p->nr_cpus_allowed == 1) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p, prev_cpu), enq_flags);
+		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		return;
+	}
+
+	/*
+	 * Prioritize kswapd and khugepaged to prevent memory pressure stalls.
+	 */
+	if (is_kswapd(p) || is_khugepaged(p)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p, prev_cpu), enq_flags);
+		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		return;
+	}
+
+	/*
+	 * If the task can only run on the current CPU, dispatch it to the
+	 * corresponding per-CPU DSQ.
+	 */
+	if (is_pcpu_task(p)) {
+		dispatch_task_kernel_mode(p, prev_cpu, enq_flags);
+		return;
+	}
+
+	/*
+	 * Attempt to dispatch directly to an idle CPU if ops.select_cpu() was
+	 * skipped.
+	 */
+	if (!__COMPAT_is_enq_cpu_selected(enq_flags) && !scx_bpf_task_running(p)) {
+		cpu = pick_idle_cpu(p, prev_cpu, 0);
+		if (cpu >= 0) {
+			dispatch_task_kernel_mode(p, cpu, enq_flags);
+			if (prev_cpu != cpu || !scx_bpf_task_running(p))
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			return;
+		}
+	}
+
+	/*
+	 * Dispatch the task to the SHARED_DSQ using deadline-based scheduling.
+	 */
+	dispatch_task_shared_kernel_mode(p, prev_cpu, enq_flags);
+
+	/*
+	 * Kick the CPU to process the newly enqueued task.
+	 */
+	scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+}
+
+/*
  * Task @p becomes ready to run. We can dispatch the task directly here if the
  * user-space scheduler is not required, or enqueue it to be processed by the
  * scheduler.
@@ -887,6 +1170,22 @@ void BPF_STRUCT_OPS(goland_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
 	bool is_wakeup = is_queued_wakeup(p, enq_flags);
+
+	/*
+	 * In kernel mode, dispatch all tasks in eBPF without user-space
+	 * scheduler involvement.
+	 */
+	if (kernel_mode) {
+		enqueue_task_kernel_mode(p, enq_flags);
+		return;
+	}
+
+	/*
+	 * ============================================================
+	 * User-space mode: the following code is only executed when
+	 * kernel_mode is false.
+	 * ============================================================
+	 */
 
 	/*
 	 * Insert the user-space scheduler to its dedicated DSQ, it will be
@@ -1055,6 +1354,25 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
 }
 
 /*
+ * Return true if the task can keep running on its current CPU from
+ * ops.dispatch(), false if the task should migrate (kernel mode).
+ */
+static bool keep_running(const struct task_struct *p, s32 cpu)
+{
+	/* Do not keep running if the task doesn't need to run */
+	if (!is_queued(p))
+		return false;
+
+	/*
+	 * If the task can only run on this CPU, keep it running.
+	 */
+	if (is_pcpu_task(p))
+		return true;
+
+	return true;
+}
+
+/*
  * Dispatch tasks that are ready to run.
  *
  * This function is called when a CPU's local DSQ is empty and ready to accept
@@ -1066,6 +1384,40 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  */
 void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 {
+	/*
+	 * In kernel mode, skip user-space scheduler related logic.
+	 */
+	if (kernel_mode) {
+		/*
+		 * Consume a task from the per-CPU DSQ.
+		 */
+		if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
+			return;
+
+		/*
+		 * Consume a task from the shared DSQ.
+		 */
+		if (scx_bpf_dsq_move_to_local(SHARED_DSQ))
+			return;
+
+		/*
+		 * If the current task expired its time slice and no other task
+		 * wants to run, simply replenish its time slice and let it run for
+		 * another round on the same CPU.
+		 */
+		if (prev && keep_running(prev, cpu))
+			prev->scx.slice = task_slice(prev, cpu);
+
+		return;
+	}
+
+	/*
+	 * ============================================================
+	 * User-space mode: the following code is only executed when
+	 * kernel_mode is false.
+	 * ============================================================
+	 */
+
 	/*
 	 * Dispatch the user-space scheduler if there's any pending action
 	 * to do. Keep consuming from SCHED_DSQ until it's empty.
@@ -1115,8 +1467,9 @@ void BPF_STRUCT_OPS(goland_dispatch, s32 cpu, struct task_struct *prev)
 void BPF_STRUCT_OPS(goland_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
+	u64 now = bpf_ktime_get_ns(), delta_t;
 
-	if (is_belong_usersched_task(p))
+	if (!kernel_mode && is_belong_usersched_task(p))
 		return;
 
 	tctx = try_lookup_task_ctx(p);
@@ -1124,6 +1477,22 @@ void BPF_STRUCT_OPS(goland_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 
 	tctx->exec_runtime = 0;
+
+	/*
+	 * In kernel mode, reset awake_vtime and update wakeup frequency.
+	 */
+	if (kernel_mode) {
+		tctx->awake_vtime = 0;
+
+		/*
+		 * Update the task's wakeup frequency based on the time since the
+		 * last wakeup, then cap the result to avoid large spikes.
+		 */
+		delta_t = now > tctx->last_woke_at ? now - tctx->last_woke_at : 1;
+		tctx->wakeup_freq = update_freq(tctx->wakeup_freq, delta_t);
+		tctx->wakeup_freq = MIN(tctx->wakeup_freq, MAX_WAKEUP_FREQ);
+		tctx->last_woke_at = now;
+	}
 }
 
 /*
@@ -1137,7 +1506,7 @@ void BPF_STRUCT_OPS(goland_running, struct task_struct *p)
 	u32 pid = p->pid;
 	bpf_map_update_elem(&running_task, &cpu, &pid, BPF_ANY);
 
-	if (is_usersched_task(p)) {
+	if (!kernel_mode && is_usersched_task(p)) {
 		usersched_last_run_at = scx_bpf_now();
 		return;
 	}
@@ -1154,6 +1523,14 @@ void BPF_STRUCT_OPS(goland_running, struct task_struct *p)
 	if (!tctx)
 		return;
 	tctx->start_ts = scx_bpf_now();
+
+	/*
+	 * In kernel mode, update global vtime_now.
+	 */
+	if (kernel_mode) {
+		if (time_before(vtime_now, p->scx.dsq_vtime))
+			vtime_now = p->scx.dsq_vtime;
+	}
 }
 
 /*
@@ -1164,8 +1541,9 @@ void BPF_STRUCT_OPS(goland_stopping, struct task_struct *p, bool runnable)
 	u64 now = scx_bpf_now();
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
+	u64 slice, delta_vtime;
 
-	if (is_belong_usersched_task(p)) {
+	if (!kernel_mode && is_belong_usersched_task(p)) {
 		if (nr_scheduled + nr_queued == 0) {
 			test_and_clear_usersched_needed();
 		}
@@ -1185,6 +1563,16 @@ void BPF_STRUCT_OPS(goland_stopping, struct task_struct *p, bool runnable)
 	 * Update the partial execution time since last sleep.
 	 */
 	tctx->exec_runtime += now - tctx->start_ts;
+
+	/*
+	 * In kernel mode, update vruntime and awake_vtime.
+	 */
+	if (kernel_mode) {
+		slice = now - tctx->start_ts;
+		delta_vtime = scale_by_task_weight_inverse(p, slice);
+		p->scx.dsq_vtime += delta_vtime;
+		tctx->awake_vtime += delta_vtime;
+	}
 }
 
 /*
@@ -1192,7 +1580,14 @@ void BPF_STRUCT_OPS(goland_stopping, struct task_struct *p, bool runnable)
  */
 void BPF_STRUCT_OPS(goland_enable, struct task_struct *p)
 {
-	p->scx.dsq_vtime = 0;
+	/*
+	 * In kernel mode, initialize vruntime to the current global vruntime.
+	 * In user-space mode, initialize to 0.
+	 */
+	if (kernel_mode)
+		p->scx.dsq_vtime = vtime_now;
+	else
+		p->scx.dsq_vtime = 0;
 	p->scx.slice = SCX_SLICE_DFL;
 }
 
@@ -1436,9 +1831,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(goland_init)
 	err = dsq_init();
 	if (err)
 		return err;
-	err = usersched_timer_init();
-	if (err)
-		return err;
+
+	/*
+	 * In user-space mode, initialize the heartbeat timer to periodically
+	 * wake up the user-space scheduler. In kernel mode, this is not needed.
+	 */
+	if (!kernel_mode) {
+		err = usersched_timer_init();
+		if (err)
+			return err;
+	}
 
 	return 0;
 }
@@ -1470,6 +1872,12 @@ void BPF_STRUCT_OPS(goland_exit, struct scx_exit_info *ei)
  */
 void BPF_STRUCT_OPS(goland_update_idle, s32 cpu, bool idle)
 {
+	/*
+	 * In kernel mode, there's no user-space scheduler to notify.
+	 */
+	if (kernel_mode)
+		return;
+
 	/*
 	 * Don't do anything if we exit from and idle state, a CPU owner will
 	 * be assigned in .running().
