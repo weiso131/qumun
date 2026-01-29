@@ -9,9 +9,9 @@ import (
 	"github.com/Gthulhu/plugin/models"
 )
 
-func (s *Sched) DrainQueuedTask() int {
+func (s *Sched) DrainQueuedTask() uint64 {
 	if s.plugin != nil {
-		return s.plugin.DrainQueuedTask(s)
+		return uint64(s.plugin.DrainQueuedTask(s))
 	}
 	return 0
 }
