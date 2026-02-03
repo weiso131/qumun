@@ -85,6 +85,16 @@ int update_priority_task(u32 pid, u64 slice) {
                                 BPF_ANY);
 }
 
+/*
+ * Note: There is a potential race condition in the two-step update process.
+ * When priority_tasks is updated first and then priority_tasks_prio, there's
+ * a brief window where the BPF code could observe a task in priority_tasks
+ * but not in priority_tasks_prio. During this window, the BPF code will
+ * default the task to priority 0 (highest priority with preemption).
+ * This is considered acceptable as it's a transient state and the BPF code
+ * handles missing priority gracefully. A more atomic approach is limited
+ * by BPF map API constraints.
+ */
 int update_priority_task_with_prio(u32 pid, u64 slice, u32 prio) {
     if (!global_obj || !global_obj->maps.priority_tasks || 
         !global_obj->maps.priority_tasks_prio)
@@ -106,16 +116,20 @@ int update_priority_task_with_prio(u32 pid, u64 slice, u32 prio) {
 int remove_priority_task(u32 pid) {
     if (!global_obj || !global_obj->maps.priority_tasks)
         return -1;
-    
+
+    int ret;
+
     /* Also remove from priority_tasks_prio if it exists */
     if (global_obj->maps.priority_tasks_prio) {
-        bpf_map__delete_elem(global_obj->maps.priority_tasks_prio, 
-                             &pid, sizeof(pid), 
-                             0);
+        ret = bpf_map__delete_elem(global_obj->maps.priority_tasks_prio,
+                                    &pid, sizeof(pid),
+                                    0);
+        if (ret != 0)
+            return ret;
     }
-    
-    return bpf_map__delete_elem(global_obj->maps.priority_tasks, 
-                                &pid, sizeof(pid), 
+
+    return bpf_map__delete_elem(global_obj->maps.priority_tasks,
+                                &pid, sizeof(pid),
                                 0);
 }
 
