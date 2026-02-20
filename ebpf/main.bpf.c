@@ -484,6 +484,32 @@ static u64 cpu_to_dsq(s32 cpu)
 }
 
 /*
+ * Calculate vtime reduction for priority levels 10-20.
+ * Higher priority (lower number) gets more vtime reduction.
+ * Returns the vtime reduction amount.
+ */
+static u64 calc_vtime_reduction(u32 prio, u64 base_vtime)
+{
+    /*
+     * Priority 10-20 get vtime reduction.
+     * Priority 10 gets 50% reduction, priority 20 gets 5% reduction.
+     * Linear interpolation: reduction = 5 + (20 - prio) * 4.5% of base_vtime
+     * Simplified: reduction = (50 - (prio - 10) * 4.5)% = (5 + (20 - prio) * 4.5)%
+     * Using integer math: (55 - prio * 4.5) -> (110 - prio * 9) / 2
+     */
+    if (prio < 10 || prio > 20)
+        return 0;
+    
+    /* 
+     * New formula: priority 10 = 50%, priority 20 = 5%
+     * reduction_pct = 50 - (prio - 10) * 4.5
+     * Using integer: (100 - (prio - 10) * 9) / 2 = (100 - 9*prio + 90) / 2 = (190 - 9*prio) / 2
+     */
+    u64 reduction_pct = (190 - prio * 9) / 2;
+    return (base_vtime * reduction_pct) / 100;
+}
+
+/*
  * Handle priority task dispatch logic.
  * Returns true if the task was dispatched as a priority task, false otherwise.
  *
@@ -584,32 +610,6 @@ static inline bool handle_priority_task(struct task_struct *p, s32 prev_cpu,
 	}
 
 	return false;
-}
-
-/*
- * Calculate vtime reduction for priority levels 10-20.
- * Higher priority (lower number) gets more vtime reduction.
- * Returns the vtime reduction amount.
- */
-static u64 calc_vtime_reduction(u32 prio, u64 base_vtime)
-{
-    /*
-     * Priority 10-20 get vtime reduction.
-     * Priority 10 gets 50% reduction, priority 20 gets 5% reduction.
-     * Linear interpolation: reduction = 5 + (20 - prio) * 4.5% of base_vtime
-     * Simplified: reduction = (50 - (prio - 10) * 4.5)% = (5 + (20 - prio) * 4.5)%
-     * Using integer math: (55 - prio * 4.5) -> (110 - prio * 9) / 2
-     */
-    if (prio < 10 || prio > 20)
-        return 0;
-    
-    /* 
-     * New formula: priority 10 = 50%, priority 20 = 5%
-     * reduction_pct = 50 - (prio - 10) * 4.5
-     * Using integer: (100 - (prio - 10) * 9) / 2 = (100 - 9*prio + 90) / 2 = (190 - 9*prio) / 2
-     */
-    u64 reduction_pct = (190 - prio * 9) / 2;
-    return (base_vtime * reduction_pct) / 100;
 }
 
 /*
